@@ -1,0 +1,552 @@
+% -*- coding: utf-8 -*-
+\documentclass[UTF8,a4paper,10pt]{ctexart}
+\usepackage[left=3.17cm, right=3.17cm, top=2.74cm, bottom=2.74cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algorithmicx}
+\usepackage{algpseudocode}
+\usepackage[colorlinks,linkcolor=black,anchorcolor=blue,urlcolor=blue]{hyperref}
+\graphicspath{{../figures/}{figures/}}
+
+\ctexset{
+  section = {name = {,、}, number = \chinese{section}},
+  subsection = {name = {（,）}, number = \chinese{subsection}},
+  subsubsection = {name = {,.}, number = \arabic{subsubsection}}
+}
+
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\lhead{\kaishu \leftmark}
+\rhead{\kaishu 高级计算机系统大作业报告}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.1pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\floatname{algorithm}{Algorithm}
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+
+\lstset{
+  language=bash,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70}\bfseries,
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{orange!70!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  tabsize=4
+}
+
+\newcommand{\HRule}{\rule{\linewidth}{0.5mm}}
+\newcommand{\TTFT}{\mathrm{TTFT}}
+\newcommand{\Saved}{\Delta T}
+\newcommand{\FigurePlaceholder}[1]{%
+  \fbox{\begin{minipage}[c][0.26\textheight][c]{0.88\textwidth}
+    \centering
+    图表占位：\texttt{\detokenize{#1}}
+  \end{minipage}}%
+}
+\newcommand{\MaybeFigure}[2][]{%
+  \IfFileExists{#2}{%
+    \includegraphics[#1]{#2}%
+  }{%
+    \IfFileExists{../figures/#2}{%
+      \includegraphics[#1]{#2}%
+    }{%
+      \IfFileExists{figures/#2}{%
+        \includegraphics[#1]{#2}%
+      }{%
+        \FigurePlaceholder{#2}%
+      }%
+    }%
+  }%
+}
+
+\begin{document}
+
+\begin{titlepage}
+    \begin{center}
+    \IfFileExists{NKU.png}{\includegraphics[width=0.78\textwidth]{NKU.png}\\[1cm]}{}
+    \textsc{\Huge \kaishu{\textbf{南\ \ \ \ \ \ 开\ \ \ \ \ \ 大\ \ \ \ \ \ 学}} }\\[0.9cm]
+    \textsc{\huge \kaishu{\textbf{计\ \ 算\ \ 机\ \ 学\ \ 院}}}\\[0.5cm]
+    \textsc{\Large \textbf{高级计算机系统大作业报告}}\\[0.8cm]
+    \HRule \\[0.9cm]
+    { \LARGE \bfseries 大模型推理前缀缓存与在线 Offload 策略实验}\\[0.4cm]
+    \HRule \\[2.0cm]
+    \centering
+    \textsc{\LARGE 丁益三 2310724\kaishu{\ \ \ \ }}\\[0.5cm]
+    \textsc{\LARGE \kaishu{年级\ :\ 2023级}}\\[0.5cm]
+    \textsc{\LARGE \kaishu{专业\ :\ 计算机科学与技术}}\\[0.5cm]
+    \textsc{\LARGE \kaishu{指导教师\ :\ 王刚}}\\[0.5cm]
+    \vfill
+    {\Large \today}
+    \end{center}
+\end{titlepage}
+
+\newpage
+\thispagestyle{empty}
+\renewcommand{\abstractname}{\kaishu \large \textbf{摘要}}
+\begin{abstract}
+本次大作业围绕大模型推理中的 Prefix Cache 和 KV Cache offload 展开。我的实现没有从一开始就直接做 offload 策略，而是先建立可复现的 vLLM 服务模式 baseline，再补充请求级 cache event 观测，最后在真实 CoQA trace 上做严格 online 的 CARGO 策略 replay。这样的顺序主要是为了避免两个常见误判：第一，把每次请求重新启动模型进程得到的延迟误认为服务场景下的 prefix-cache 行为；第二，在策略 replay 中提前使用 future reuse 信息，使策略看起来有效但无法真实部署。
+
+实验结果显示，vLLM 原生 Prefix Cache 在长前缀、高复用场景下确实能显著降低首 token 延迟。以 CoQA 1536-token 前缀为例，warm 请求相对关闭 Prefix Cache 的 median TTFT saved 为 38.37ms，speedup 约为 2.08x；但当 prefix group 数从 16 增至 24 后，GPU-only cache 的 revisit useful-hit rate 从约 1.0 跌至 0，hit coverage 下降到约 0.021，同时出现数千次 eviction。这说明 GPU 内部 prefix cache 的问题不是“能否命中一个 block”，而是在容量压力下能否保住足够长的有用前缀。
+
+基于这一现象，我把 offload 策略抽象为两级缓存 replay。CARGO 策略只使用当前请求之前的访问历史、prefix 长度、估计 KV 大小、最近访问时间和固定 first-access prior，不读取 \texttt{planned\_reuse\_count}、\texttt{phase} 或未来访问位置。策略的核心是用“单位字节的期望 TTFT 净收益”决定 GPU/CPU placement，并用 coverage guard 过滤只有短 header 命中的假阳性。在 CoQA popularity-skew trace 上，online CARGO 在 g24+g32+g48 设置下恢复 TTFT saved 15.20s，优于 LRU/LFU 的 14.24s 和 size-aware 的 12.93s；在 mixed prefix length trace 上，CARGO 恢复 6.93s，而 best conventional 只有 2.86s。这个差异说明，offload 策略不能只追求 hit 数量，还要同时考虑 prefix 的长度、reload 成本和一次命中能节省多少 prefill。
+
+我也尝试了 LMCache MP mode 的真实 CPU offload baseline。该路径在隔离环境中成功跑通，LMCache server 能观察到跨进程 L1 prefix hit；但在 WSL2 上 CUDA IPC 出现 \texttt{invalid resource handle}，只能退回 non-GPU transfer，导致 g24/g32 revisit TTFT 仍在 338--350ms 左右。因此，本报告没有把 LMCache 结果包装成完整性能收益，而把它作为真实系统部署风险和后续 native Linux 实验的依据。
+
+\par\noindent\textbf{关键词：} 大模型推理；vLLM；Prefix Cache；KV Cache；CoQA；在线策略；CARGO；Offload
+\end{abstract}
+
+\tableofcontents
+\newpage
+\setcounter{page}{1}
+
+\textbf{项目仓库：} \texttt{https://github.com/Ding-1203/kv-cache-offload}
+
+\section{实验背景与任务理解}
+
+大模型推理通常可以分为 prefill 和 decode 两个阶段。prefill 阶段需要对 prompt 中的 token 逐层计算 Key/Value 张量；decode 阶段则在已有 KV Cache 的基础上逐 token 生成。对于长上下文问答、文档检索增强、代码补全等应用，多个请求往往共享相同的 system prompt、文档正文或 story，只在最后的问题部分不同。如果每个请求都重复计算共享前缀的 KV，prefill 会成为明显浪费；Prefix Cache 的作用就是把已经计算过的共享前缀 KV 保存下来，在后续请求中直接复用。
+
+本题目要求关注的是“前缀缓存与换入换出策略”，而不是单纯调用一个现成开关。我的理解是，作业至少包含三层问题。第一层是系统问题：在真实推理服务中，Prefix Cache 是否真的跨请求生效，TTFT 是否下降。第二层是观测问题：当 latency 改变时，内部 cache hit、hit tokens 和 eviction 是否能解释这个变化。第三层是策略问题：当 GPU KV cache 容量不足时，哪些前缀值得继续放在 GPU，哪些可以 offload 到 CPU，哪些即使 offload 也不值得 reload。
+
+因此，我的实际工作按“先基线、再观测、后策略”的顺序推进。前半部分使用 vLLM OpenAI-compatible server，模型只启动一次并常驻 GPU，runner 连续发送请求，以保证 Prefix Cache 可以跨请求复用。后半部分在 CoQA trace 上构造容量压力，并用 replay 的方式验证 CARGO 这样的 utility-aware 策略是否优于 LRU、LFU 和 size-aware 等常规策略。这里刻意把 replay 设为 online：除了 oracle upper bound 外，所有策略只能看到当前请求之前的信息。这样虽然会降低策略上限，但更接近真实系统中可以部署的决策条件。
+
+\section{实验环境与总体框架}
+
+\subsection{软硬件环境}
+
+实验在 WSL2 Ubuntu 22.04 环境中完成，核心软件版本和硬件条件如表 \ref{tab:env} 所示。所有 vLLM 实验均优先使用本地模型路径 \texttt{QWEN05B\_PATH}，避免重复下载模型。由于显存只有 8GB，我选择 Qwen2.5-0.5B-Instruct 作为主模型。这个模型足够小，可以在本地稳定运行；同时它仍然具有真实 transformer KV Cache 结构，能够反映 prefix reuse 和 capacity pressure 对 TTFT 的影响。
+
+\begin{table}[H]
+\centering
+\small
+\caption{实验环境配置}
+\label{tab:env}
+\begin{tabular}{ll}
+\toprule
+项目 & 配置 \\
+\midrule
+操作系统 & WSL2 Ubuntu 22.04 \\
+GPU & NVIDIA RTX 4060 Laptop GPU, 8GB \\
+模型 & Qwen2.5-0.5B-Instruct，本地路径由 \texttt{QWEN05B\_PATH} 提供 \\
+Python & 3.12.13 \\
+vLLM & 0.20.0+cu129 \\
+PyTorch & 2.11.0+cu129 \\
+Triton & 3.6.0 \\
+主要数据 & CoQA train/validation 派生的 story-question 请求 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{实验框架}
+
+整体框架由 workload builder、runner、observer 和 analyzer 四部分组成。workload builder 将 CoQA story 和 question 转成 JSONL 请求，每行包含 \texttt{request\_id}、\texttt{prefix\_group}、prompt、prefix 长度和场景标签。runner 逐行读取 JSONL，通过 vLLM OpenAI API 发送请求，并记录 TTFT、total latency、prompt tokens、开始时间和结束时间。observer 通过 \texttt{sitecustomize.py} 和 monkey patch 注入 vLLM 进程，记录 prefix lookup、prefix hit/miss、block touch、store、free 和 evict 事件。analyzer 最后把 latency CSV 与 cache event JSONL 对齐，生成 summary 和图表。
+
+这个框架里最关键的实验约束是服务模式。vLLM server 在每组实验中只启动一次，模型常驻 GPU，runner 在同一服务进程生命周期内连续发送多个请求。只有这样，上一条请求写入的 KV block 才可能被下一条请求复用。如果把每个请求写成独立 Python 进程并反复初始化模型，那么 Prefix Cache 每次都会被清空，实验结论会偏离真实在线服务。
+
+\begin{algorithm}[H]
+\caption{服务模式下的 Prefix Cache 实验 runner}
+\label{alg:runner}
+\begin{algorithmic}[1]
+\Require JSONL workload, vLLM OpenAI endpoint, model name
+\Ensure 每个请求的 latency CSV
+\State 启动一次 vLLM server，使模型和 Prefix Cache 常驻服务进程
+\For{workload 中的每一行请求 $r$}
+    \State 读取 prompt、prefix group、request id 和实验标签
+    \State 通过 OpenAI-compatible API 发送请求，并在 extra body 中传入 request id
+    \State 记录请求开始时间、首 token 到达时间、结束时间和状态
+    \State 将 TTFT、total latency、prompt tokens、prefix group、scenario 写入 CSV
+\EndFor
+\State 如开启 observer，则按 request id 和时间窗口将 cache event 与 latency CSV 对齐
+\end{algorithmic}
+\end{algorithm}
+
+\section{指标定义与问题建模}
+
+\subsection{TTFT 与 Prefix Cache 收益}
+
+本报告主要使用 TTFT（time to first token）作为延迟指标。对于交互式问答服务，用户最直接感受到的是首 token 出现时间，而 Prefix Cache 主要减少的是 prefill 计算，因此 TTFT 比 total latency 更能体现前缀复用收益。对一个请求 $q$，可以把 TTFT 粗略分解为
+\begin{equation}
+\TTFT(q) \approx T_{\mathrm{sched}}(q) + T_{\mathrm{lookup}}(q)
+    + T_{\mathrm{prefill}}\!\left(L_q-H_q\right)
+    + T_{\mathrm{decode},1}(q) + \epsilon_q .
+\label{eq:ttft}
+\end{equation}
+其中 $L_q$ 是 prompt 中需要 prefill 的前缀 token 数，$H_q$ 是被 Prefix Cache 命中的 token 数。Prefix Cache 的理想作用是增大 $H_q$，从而减少实际 prefill 的 token 数 $L_q-H_q$。由于调度、网络、本地进程负载等因素会带来噪声，单个请求的 TTFT 并不稳定，所以后续表格主要报告 median 或按场景聚合后的结果。
+
+我将开启和关闭 Prefix Cache 的 TTFT 差定义为
+\begin{equation}
+\Saved(q) = \TTFT_{\mathrm{off}}(q) - \TTFT_{\mathrm{on}}(q).
+\label{eq:saved}
+\end{equation}
+当 $\Saved(q)>0$ 时，开启 Prefix Cache 降低了首 token 延迟；当 $\Saved(q)\le 0$ 时，说明该请求没有从缓存复用中得到可观收益，或者收益被系统噪声抵消。这个定义也用于后续 replay 中估计某个 prefix 被命中时可能节省的 prefill 时间。
+
+\subsection{Hit coverage 与 useful hit}
+
+只记录是否发生 prefix hit 并不够。vLLM 的 prefix cache 以 block 为单位工作，有时请求可能命中很短的公共 header，但真正的大段 story 前缀已经被 evict。此时 binary hit 为真，但 TTFT 仍接近 cold miss。为避免这种假阳性，我使用 hit coverage 衡量命中 token 占目标前缀长度的比例：
+\begin{equation}
+\rho(q) = \frac{H_q}{L^p_q},
+\qquad
+\mathrm{useful}(q)=\mathbf{1}\left[H_q \ge 32 \land \rho(q)\ge \theta\right].
+\label{eq:coverage}
+\end{equation}
+其中 $L^p_q$ 是该请求所属 prefix group 的目标前缀长度，$\theta$ 在实验中取 $0.5$。额外的 32-token 下界用于过滤 system prompt 或短 header 带来的伪命中。下文所有 useful-hit rate 均按公式 \ref{eq:coverage} 计算；后续章节只引用该定义，用它区分“发生过短命中”和“命中了足够长的可复用前缀”。
+
+\subsection{KV Cache 大小估计}
+
+Offload 策略需要比较“保留某个 prefix 的收益”和“它占用的空间”。我在 replay 中以 prefix group 为粒度估计 KV 大小，而不是模拟 vLLM 内部每个 block 的张量布局。对长度为 $L_p$ 的 prefix，估计字节数为
+\begin{equation}
+B(p)=
+\left\lceil \frac{L_p}{b} \right\rceil b
+\cdot 2 \cdot N_{\mathrm{layer}} \cdot N_{\mathrm{kv\_head}}
+\cdot d_{\mathrm{head}} \cdot s_{\mathrm{dtype}} .
+\label{eq:kvbytes}
+\end{equation}
+其中 $b$ 是 vLLM block size，系数 2 对应 Key 和 Value。对本实验中的 Qwen2.5-0.5B-Instruct，近似取 $b=16$，$N_{\mathrm{layer}}=24$，$N_{\mathrm{kv\_head}}=2$，$d_{\mathrm{head}}=64$，FP16/BF16 的 $s_{\mathrm{dtype}}=2$ bytes。因此每个 token 的 KV 大小约为
+\[
+2 \times 24 \times 2 \times 64 \times 2 = 12288\ \mathrm{bytes},
+\]
+1536-token prefix 约占 $18.0$ MiB。这个数量级解释了为什么在 8GB 笔记本 GPU 上，prefix group 数稍微增加就会触发明显的 cache eviction。
+
+\section{vLLM Prefix Cache Baseline}
+
+\subsection{从构造 workload 到 CoQA workload}
+
+第一阶段我先用构造 workload 验证实验框架是否能稳定复现 Prefix Cache 收益，包括 Prefix Cache ON/OFF、不同 prefix 长度、不同复用率和多 prefix group 轮换访问。这一步的价值在于排除工程层错误，例如服务没有复用、请求格式不一致、max model length 设置过小等。随后我将主要实验换成 CoQA。CoQA 每条样本包含一个 story 和围绕该 story 的多轮 question，天然对应“相同长前缀 + 不同问题”的请求模式，比随机拼接文本更接近真实问答服务。
+
+CoQA workload 分为三类。第一类是 prefix-length sweep，固定复用结构但改变 story 前缀长度，用来观察长前缀是否带来更大 TTFT saved。第二类是 popularity-skew，不同 story 的访问热度不同，用来观察热前缀是否贡献了更多累计收益。第三类是 capacity-pressure，先 seed 若干 prefix group，再插入大量 filler group，最后 revisit seed group，用来观察 GPU-only Prefix Cache 在容量压力下是否发生 cliff。
+
+\subsection{Prefix 长度决定可节省的 prefill}
+
+表 \ref{tab:prefix-length} 展示了 CoQA prefix-length sweep 中 warm 请求的 median TTFT。这里的 \texttt{Prefix ON} 表示 vLLM Prefix Cache 开启时的 TTFT，\texttt{Prefix OFF} 表示关闭 Prefix Cache 的对照结果。512-token 档位没有稳定收益，median saved 为 $-1.82$ms，这主要说明短前缀的可节省 prefill 不足以稳定超过调度和测量噪声。从 768 token 开始，saved TTFT 随 prefix 长度增加而持续扩大；到 1536 token 时，median saved 为 38.37ms，speedup 约为 2.08x。
+
+\begin{table}[H]
+\centering
+\small
+\caption{CoQA prefix length sweep：warm 请求的 TTFT 对比}
+\label{tab:prefix-length}
+\begin{tabular}{cccccc}
+\toprule
+Prefix bucket & 请求数 & Prefix ON TTFT(ms) & Prefix OFF TTFT(ms) & Saved(ms) & Speedup \\
+\midrule
+512  & 120 & 35.73 & 33.72 & -1.82 & 0.95x \\
+768  & 120 & 33.81 & 43.75 & 10.03 & 1.30x \\
+1024 & 120 & 33.44 & 54.96 & 21.35 & 1.63x \\
+1280 & 120 & 34.33 & 65.15 & 30.24 & 1.89x \\
+1536 & 120 & 36.09 & 74.93 & 38.37 & 2.08x \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+图 \ref{fig:coqa-prefix-length} 对这一趋势做了可视化。更重要的不是单个点的数值，而是图中左右轴的语义关系：当 saved 为 0ms 时，speedup 应接近 1.0x；当 prefix 更长时，关闭 Prefix Cache 的 prefill 成本继续增加，而开启 Prefix Cache 后 warm 请求的 TTFT 基本维持在 33--36ms 区间。这个形态说明 Prefix Cache 的收益来自减少重复 prefill，而不是 decode 或网络开销的偶然变化。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.92\textwidth]{cache_observation/coqa_final/01_coqa_prefix_length_ttft_savings.png}
+\caption{CoQA prefix length sweep：prefix 越长，Prefix Cache 对 TTFT 的节省越明显。该图对应真实输出 \texttt{figures/cache\_observation/coqa\_final/01\_coqa\_prefix\_length\_ttft\_savings.png}。}
+\label{fig:coqa-prefix-length}
+\end{figure}
+
+\subsection{Cold 与 warm 请求必须分开看}
+
+表 \ref{tab:on-off-state} 将 CoQA prefix-length 和 popularity-skew 两类实验按 cold/warm 分开统计。cold 请求是某个 prefix group 的首次访问，此时没有可复用 KV；warm 请求是同一 prefix group 的后续访问。结果显示，cold 请求几乎没有收益，甚至会因为系统噪声出现轻微负收益；warm 请求则稳定降低 TTFT。在 popularity-skew 中，warm saved 达到 39.44ms，和 1536-token 长前缀的结果一致。
+
+\begin{table}[H]
+\centering
+\small
+\caption{CoQA 实验中 cold/warm 请求的 Prefix Cache ON/OFF 对比}
+\label{tab:on-off-state}
+\begin{tabular}{llccccc}
+\toprule
+实验类型 & 状态 & 请求数 & ON TTFT(ms) & OFF TTFT(ms) & Saved(ms) & Useful hit \\
+\midrule
+Prefix length & cold & 200 & 55.78 & 54.65 & -0.04 & 0.00 \\
+Prefix length & warm & 600 & 34.53 & 54.97 & 20.82 & 1.00 \\
+Popularity skew & cold & 92 & 74.92 & 75.13 & -0.09 & 0.00 \\
+Popularity skew & warm & 272 & 36.08 & 75.48 & 39.44 & 1.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+图 \ref{fig:coqa-on-off} 的作用是给 baseline 结论加上边界条件。Prefix Cache 不是一个无条件的加速开关；它的收益只在“相同前缀已经被计算过，并且后续请求仍能命中足够长的缓存前缀”时出现。这个结论也直接引出下一阶段的问题：如果 GPU cache 容量不足，warm 请求会重新退化成 cold-like 请求。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.92\textwidth]{cache_observation/coqa_final/02_coqa_on_off_by_cache_state.png}
+\caption{CoQA cold/warm 请求下 Prefix Cache ON/OFF 的 TTFT 对比。该图对应真实输出 \texttt{figures/cache\_observation/coqa\_final/02\_coqa\_on\_off\_by\_cache\_state.png}。}
+\label{fig:coqa-on-off}
+\end{figure}
+
+\section{Prefix Cache 观测与容量压力}
+
+\subsection{vLLM 内部事件观测}
+
+为了避免只从外部 latency 推断缓存行为，我实现了一个轻量级 observer。服务启动脚本将 \texttt{PYTHONPATH} 指向项目的 \texttt{src/}，并在设置 \texttt{VLLM\_CACHE\_OBSERVER=1} 后让 vLLM API 进程和 EngineCore 子进程在导入 \texttt{sitecustomize.py} 时自动调用 \texttt{vllm\_cache\_observer.install()}。这个 observer 只包裹 cache 管理层的方法，不修改调度、分配或 eviction 策略，因此不会改变被观测系统本身的行为。
+
+具体插桩分成两层。第一层在 \texttt{KVCacheManager.get\_computed\_blocks} 外包装请求级 prefix lookup，记录 \texttt{prefix\_lookup}，并根据 \texttt{hit\_tokens} 进一步写入 \texttt{prefix\_hit} 或 \texttt{prefix\_miss}；同时保存 vLLM 内部 request id、归一化后的 workload request id、hit tokens、hit blocks、prompt tokens 以及命中的 block hash。\texttt{allocate\_slots} 和 \texttt{free} 主要用于维护当前请求上下文，使后续 block 级事件能够带上对应的 request id。第二层在 \texttt{BlockPool.cache\_full\_blocks}、\texttt{touch}、\texttt{free\_blocks} 和 \texttt{\_maybe\_evict\_cached\_block} 上记录 \texttt{block\_store}、\texttt{block\_touch}、\texttt{block\_free} 和 \texttt{block\_evict}，字段包括 block id、block hash 和 ref count。
+
+这些事件统一由 JSONL logger 追加写入，基础字段包括 \texttt{timestamp}、\texttt{pid}、\texttt{event\_type}、\texttt{internal\_request\_id}、\texttt{request\_id}、\texttt{hit\_tokens}、\texttt{hit\_blocks}、\texttt{block\_id}、\texttt{block\_hash} 和 \texttt{ref\_cnt}。前文已经用公式 \ref{eq:coverage} 定义了 hit coverage 和 useful-hit 判定；本节的 observer 主要提供计算这些指标所需的 $H_q$、block 事件和 eviction 证据，并通过 request id 与 runner CSV 对齐，从而解释 TTFT 曲线背后的真实 cache 行为。
+
+\subsection{热度与累计收益的关系}
+
+Popularity-skew workload 用不同 planned reuse count 的 CoQA story 模拟热度差异。表 \ref{tab:popularity} 展示了热度越高，warm saved 和 useful-hit rate 越稳定；当 planned reuse count 从 1 增加到 8 或 12 时，useful-hit rate 从 0.50 提升到 0.89/0.92，warm saved 也维持在约 39ms。这里 planned reuse count 只用于 workload 构造和结果分组，后续 online 策略不会直接读取它。
+
+\begin{table}[H]
+\centering
+\small
+\caption{CoQA popularity-skew：访问热度与 warm 收益}
+\label{tab:popularity}
+\begin{tabular}{ccccc}
+\toprule
+Planned reuse count & Prefix groups & 请求数 & Warm saved(ms) & Useful-hit rate \\
+\midrule
+1  & 32 & 64 & 5.65  & 0.50 \\
+2  & 32 & 96 & 36.26 & 0.67 \\
+4  & 16 & 80 & 38.67 & 0.80 \\
+8  & 8  & 72 & 39.84 & 0.89 \\
+12 & 4  & 52 & 39.51 & 0.92 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+图 \ref{fig:coqa-pareto} 进一步说明，prefix cache 的收益具有明显集中性。少量高复用 prefix group 贡献了较多累计 saved TTFT。这正是 utility-aware offload 的动机：如果 GPU 放不下所有 KV，保留“更可能再次访问、且一次命中能节省更多 prefill”的 prefix，比机械地保留最近访问或最小对象更合理。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.92\textwidth]{cache_observation/coqa_final/03_coqa_popularity_utility_pareto.png}
+\caption{CoQA popularity-skew：prefix 热度、累计收益和 utility 集中性。该图对应真实输出 \texttt{figures/cache\_observation/coqa\_final/03\_coqa\_popularity\_utility\_pareto.png}。}
+\label{fig:coqa-pareto}
+\end{figure}
+
+\subsection{容量 pressure cliff}
+
+容量压力实验采用 seed--filler--revisit 访问模式。先访问 $g$ 个 seed prefix group，使它们进入 cache；随后访问 $4g$ 个 filler group，占用大量 KV 空间；最后再次访问 seed group，观察 seed 是否仍能命中。这个设计刻意模拟真实服务中的“热点文档被其他请求冲掉后再次访问”的场景。
+
+表 \ref{tab:pressure} 是最关键的 baseline 结果。g8 和 g16 下，revisit 请求仍然基本保持 useful hit，median TTFT 在 39--42ms 左右；但从 g24 开始，revisit TTFT 突然上升到约 76ms，useful-hit rate 变为 0，hit coverage 只有 0.0208，同时观测到数千次 eviction。这个 cliff 说明，GPU-only Prefix Cache 在容量足够时表现很好，但一旦超过某个工作集阈值，就会把原本 warm 的请求重新变成 cold-like 请求。
+
+\begin{table}[H]
+\centering
+\small
+\caption{CoQA capacity-pressure：revisit 阶段的 cache cliff}
+\label{tab:pressure}
+\begin{tabular}{cccccc}
+\toprule
+Prefix groups & Revisit TTFT(ms) & P90 TTFT(ms) & Useful-hit rate & Hit coverage & Evictions \\
+\midrule
+8  & 41.63 & 44.05 & 1.00 & 1.0000 & 0 \\
+16 & 39.36 & 47.40 & 1.00 & 0.9993 & 0 \\
+24 & 75.94 & 79.72 & 0.00 & 0.0208 & 3496 \\
+32 & 76.27 & 79.09 & 0.00 & 0.0208 & 3033 \\
+48 & 76.00 & 78.89 & 0.00 & 0.0208 & 4641 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+图 \ref{fig:coqa-pressure} 将这个 cliff 同时画在 TTFT、hit coverage 和 eviction 维度上。相比单独报告 TTFT，这张图更清楚地说明了性能退化的原因：不是模型突然变慢，而是 prefix cache 中可复用的长前缀被容量压力驱逐了。由此可以得到后续 offload 的核心问题：如果 GPU 放不下所有 prefix，是否可以把被驱逐但未来可能有价值的 prefix 放到 CPU，并在 revisit 时用低于 cold prefill 的成本 reload。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.92\textwidth]{cache_observation/coqa_final/04_coqa_pressure_cliff.png}
+\caption{CoQA capacity-pressure：g16 到 g24 之间出现明显 cache cliff，revisit TTFT 上升且 useful-hit rate 归零。该图对应真实输出 \texttt{figures/cache\_observation/coqa\_final/04\_coqa\_pressure\_cliff.png}。}
+\label{fig:coqa-pressure}
+\end{figure}
+
+\section{Online CARGO Replay 策略}
+
+\subsection{为什么不能直接用未来信息}
+
+在最初的 replay 设计中，一个容易犯的错误是使用 workload 中的 planned reuse count 或 phase 标签来指导策略。这样的策略在离线分析中可能表现很好，但真实系统在当前时刻并不知道某个 prefix 之后还会被访问几次，也不知道当前请求属于 seed、filler 还是 revisit。因此，我在最终版本中把策略分为两类。非 oracle 策略只能使用历史信息，包括当前请求之前的访问次数、最近访问时间、prefix 长度、估计 KV 大小和历史观测得到的 saved curve。Oracle upper bound 可以使用 future reuse，但它只作为上界，不作为可部署策略。
+
+这个约束使实验结论更保守，也更有意义。如果 online CARGO 仍然优于 LRU、LFU 和 size-aware，说明它的优势来自对历史信号、对象大小和 reload 成本的建模，而不是偷看未来。
+
+\subsection{策略建模}
+
+Replay 中的缓存粒度是 prefix group。GPU 层表示 vLLM 内部可快速命中的 KV；CPU 层表示被 offload 后仍可 reload 的 KV。由于我没有修改 vLLM 内部 KV tensor reload，本阶段 replay 不模拟 block-level tensor 传输，而是用一个成本模型估计 CPU reload 的收益。对 prefix $p$，从 baseline 得到的长度相关 saved curve 记为 $S(L_p)$，CPU reload 成本估计为
+\begin{equation}
+C_{\mathrm{cpu}}(p) = c_0 + \frac{B(p)}{\mathrm{BW}_{\mathrm{cpu}}},
+\label{eq:reload-cost}
+\end{equation}
+其中 $c_0$ 是固定调度开销，实验中取 8ms，$\mathrm{BW}_{\mathrm{cpu}}$ 取 2GB/s。则一次 CPU reload 的净收益为
+\begin{equation}
+G_{\mathrm{reload}}(p) =
+\max\left(0, S(L_p) - C_{\mathrm{cpu}}(p)\right).
+\label{eq:net-gain}
+\end{equation}
+如果 reload 成本已经超过命中该 prefix 能节省的 prefill 时间，那么即使 CPU 中保存了该 prefix，也不应该为了它付出 reload 开销。
+
+CARGO 的核心打分是单位字节 utility。令 $n_p(t-1)$ 为当前时刻前 prefix $p$ 已经被访问的次数，历史热度信号为
+\begin{equation}
+A_p(t)=\alpha+\max(0,n_p(t-1)-1),
+\label{eq:history-signal}
+\end{equation}
+其中 $\alpha=0.25$ 是 first-access prior，用来避免新 prefix 完全没有进入 CPU 的机会。GPU 侧保留价值和 CPU 侧 reload/offload 价值分别定义为
+\begin{equation}
+U_{\mathrm{gpu}}(p,t)=\frac{S(L_p)\cdot A_p(t)}{B(p)},
+\qquad
+U_{\mathrm{cpu}}(p,t)=\frac{G_{\mathrm{reload}}(p)\cdot A_p(t)}{B(p)}.
+\label{eq:cargo-score}
+\end{equation}
+当 GPU 容量不足时，CARGO 优先驱逐 $U_{\mathrm{gpu}}$ 较低的 prefix；被驱逐对象只有在 $U_{\mathrm{cpu}}>0$ 时才进入 CPU 层。这样做的直觉是，长 prefix 一次命中可能节省更多 prefill，但它也占用更多字节；高热度 prefix 更值得保留，但如果 reload 成本过高，放到 CPU 也未必划算。
+
+\begin{algorithm}[H]
+\caption{Online CARGO replay 决策流程}
+\label{alg:cargo}
+\begin{algorithmic}[1]
+\Require 请求序列 $q_1,\ldots,q_T$，GPU 容量 $C_g$，CPU 容量 $C_c$
+\Ensure 每个策略的 recovered TTFT saved、GPU hit、CPU reload 和 cold miss
+\State 初始化 GPU cache、CPU cache 和每个 prefix 的历史计数
+\For{$t=1$ to $T$}
+    \State 令 $p$ 为请求 $q_t$ 的 prefix group
+    \If{$p$ 在 GPU cache 且满足 coverage guard}
+        \State 记录 GPU hit，获得 $S(L_p)$ 的 saved
+    \ElsIf{$p$ 在 CPU cache 且 $G_{\mathrm{reload}}(p)>0$}
+        \State 记录 CPU reload，获得 $G_{\mathrm{reload}}(p)$ 的净 saved
+        \State 将 $p$ 提升到 GPU cache
+    \Else
+        \State 记录 cold miss
+    \EndIf
+    \While{GPU cache 占用超过 $C_g$}
+        \State 按 $U_{\mathrm{gpu}}$ 选择最低价值 prefix $v$ 驱逐
+        \If{$U_{\mathrm{cpu}}(v)>0$ 且 CPU cache 有可用价值}
+            \State 将 $v$ 放入 CPU cache；必要时驱逐 CPU 中最低 $U_{\mathrm{cpu}}$ 的 prefix
+        \EndIf
+    \EndWhile
+    \State 使用请求 $q_t$ 更新 $p$ 的访问次数和最近访问时间
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+对照策略包括 GPU-only、CPU LRU、CPU LFU、size-aware、CARGO 和 oracle upper bound。LRU 只看最近访问时间，适合时间局部性强但对象大小相近的场景；LFU 只看历史次数，可能保留很久以前的热对象；size-aware 倾向于保留小对象，但可能把 saved 很低的小 prefix 留下来；CARGO 则试图同时考虑 saved、bytes、历史热度和 reload 成本。Oracle 使用 future reuse，因此只代表上限。
+
+\subsection{Replay 结果分析}
+
+表 \ref{tab:cargo-summary} 汇总了 g24、g32 和 g48 三个超过 GPU-only cliff 的容量压力场景。Popularity-skew trace 中，GPU-only 只能恢复 9.06s saved，因为很多 revisit 已经变成 cold miss；LRU/LFU 通过 CPU 层恢复到 14.24s；CARGO 进一步提升到 15.20s。这个提升并不夸张，因为 popularity-skew 中 prefix 长度较一致，LRU/LFU 已经能利用访问热度。CARGO 的优势主要来自减少低价值对象占位，并在 CPU reload 前扣除传输成本。
+
+Mixed-length trace 更能体现 utility-aware 的必要性。LRU/LFU/GPU-only 在该 trace 上几乎无法恢复 saved；size-aware 的 useful-hit rate 反而达到 0.380，但 recovered saved 只有 2.86s。这说明“命中次数多”并不等价于“节省时间多”，因为它可能命中的是短 prefix 或低 saved prefix。CARGO 的 useful-hit rate 只有 0.197，却恢复了 6.93s saved，说明它更倾向于选择少量高价值 prefix，而不是追求表面 hit rate。
+
+\begin{table}[H]
+\centering
+\small
+\caption{Online replay 在 g24+g32+g48 下的策略对比}
+\label{tab:cargo-summary}
+\begin{tabular}{llccccc}
+\toprule
+Trace & 策略 & Recovered saved(s) & Useful rate & GPU hit & CPU reload & Cold miss \\
+\midrule
+\multirow{5}{*}{Popularity skew}
+& GPU-only & 9.06 & 0.289 & 236 & 0   & 580 \\
+& LRU/LFU  & 14.24 & 0.593 & 236 & 248 & 332 \\
+& Size-aware & 12.93 & 0.578 & 176 & 296 & 344 \\
+& CARGO & 15.20 & 0.612 & 273 & 226 & 317 \\
+& Oracle upper bound & 24.61 & 0.885 & 545 & 177 & 94 \\
+\midrule
+\multirow{5}{*}{Mixed length}
+& GPU-only & 0.00 & 0.000 & 0 & 0   & 1800 \\
+& LRU/LFU  & 0.00 & 0.000 & 0 & 0   & 1800 \\
+& Size-aware & 2.86 & 0.380 & 576 & 108 & 1116 \\
+& CARGO & 6.93 & 0.197 & 25 & 329 & 1446 \\
+& Oracle upper bound & 16.56 & 0.374 & 300 & 374 & 1126 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+图 \ref{fig:no-future} 是 online 约束的 sanity check。它用于确认非 oracle 策略没有读取未来字段，并展示 CARGO 与 oracle 之间仍然存在明显差距。如果 CARGO 接近 oracle，需要怀疑是否泄漏了 future reuse；而当前结果中 CARGO 明显低于 oracle，但稳定高于 conventional baseline，这更符合一个可部署在线策略的预期。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.88\textwidth]{offload_online/01_no_future_sanity.png}
+\caption{Online replay 的 no-future sanity check。该图对应真实输出 \texttt{figures/offload\_online/01\_no\_future\_sanity.png}。}
+\label{fig:no-future}
+\end{figure}
+
+图 \ref{fig:policy-gain} 和图 \ref{fig:capacity-sweep} 分别从策略收益和容量变化角度展示结果。前者强调 CARGO 在两个 trace 上都不依赖 future 信息仍能超过常规策略；后者显示随着压力增大，GPU-only 的 saved 受限，而 CARGO 可以通过 CPU 层恢复一部分 cliff 后损失的收益。不过 CARGO 和 oracle 之间仍有差距，说明单纯依靠历史计数和静态 saved curve 还不足以完全预测未来访问，后续可以进一步加入时间衰减、队列状态和应用侧会话信息。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.88\textwidth]{offload_online/02_policy_gain.png}
+\caption{Online CARGO 与 LRU、LFU、size-aware、GPU-only 和 oracle 的 recovered TTFT saved 对比。该图对应真实输出 \texttt{figures/offload\_online/02\_policy\_gain.png}。}
+\label{fig:policy-gain}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.88\textwidth]{offload_online/03_capacity_sweep.png}
+\caption{不同 pressure level 下的策略收益变化。该图对应真实输出 \texttt{figures/offload\_online/03\_capacity\_sweep.png}。}
+\label{fig:capacity-sweep}
+\end{figure}
+
+图 \ref{fig:decision-audit} 用于解释策略行为本身。它不是只报告最终 saved，而是把 GPU hit、CPU reload 和 cold miss 拆开。这个拆分能看出 CARGO 的策略特征：它没有盲目增加 CPU reload 次数，而是在 reload 成本模型允许的情况下选择更高净收益的 prefix。因此，在 mixed-length trace 上它的 useful rate 不最高，但 recovered saved 更高。
+
+\begin{figure}[H]
+\centering
+\MaybeFigure[width=0.88\textwidth]{offload_online/04_decision_audit.png}
+\caption{CARGO replay 的决策审计：GPU hit、CPU reload 与 cold miss 的组成。该图对应真实输出 \texttt{figures/offload\_online/04\_decision\_audit.png}。}
+\label{fig:decision-audit}
+\end{figure}
+
+\section{LMCache 真实系统探索}
+
+策略 replay 只能证明 offload 决策在 trace 层面有价值，不能替代真实系统实验。因此我也尝试了 LMCache MP mode。由于当前 vLLM、torch、triton 和 CUDA 版本已经验证可用，我没有直接在原始 \texttt{.venv} 中裸装 LMCache，而是先冻结环境并用 constraints 防止 resolver 自动升级或降级关键包。实际部署时，LMCache server 单独启动，vLLM 通过 \texttt{LMCacheMPConnector} 连接，并在 vLLM 0.20.0 下指定 LMCache-shipped connector module path。
+
+这个路径的正面结果是功能上跑通了：two-request shared-prefix smoke 能在 LMCache 日志中看到 store/retrieve，CoQA pressure 中也能观察到 L1 prefix hit。表 \ref{tab:lmcache} 展示了真实 LMCache baseline 的阶段性结果。g16 下 revisit TTFT 为 38.8ms，接近 GPU warm cache；但 g24/g32 下 revisit TTFT 仍为 350.0ms 和 338.1ms，明显高于 GPU warm，也没有达到理想 CPU offload 性能。
+
+\begin{table}[H]
+\centering
+\small
+\caption{LMCache MP mode 真实系统探索结果}
+\label{tab:lmcache}
+\begin{tabular}{lcccc}
+\toprule
+实验文件 & 请求完成数 & Seed TTFT(ms) & Filler TTFT(ms) & Revisit TTFT(ms) \\
+\midrule
+\texttt{coqa\_pressure\_g16.csv} & 96/96  & 385.9 & 399.5 & 38.8 \\
+\texttt{coqa\_pressure\_g24.csv} & 144/144 & 413.9 & 381.9 & 350.0 \\
+\texttt{coqa\_pressure\_g32.csv} & 192/192 & 394.2 & 385.8 & 338.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+我认为这部分结果应当如实解释，而不是强行写成性能优化成功。WSL2 环境下 LMCache 的 GPU transfer 路径出现 CUDA IPC \texttt{invalid resource handle}，实际只能退回 non-GPU transfer。这样虽然证明了 KV 可以跨 LMCache server 和 vLLM 连接器进行存取，但 CPU reload 的路径开销太高，抵消了 prefix prefill saved。g24/g32 的 revisit TTFT 相比 seed/filler 有一定下降，但距离 GPU Prefix Cache warm baseline 的 36ms 量级仍然很远。
+
+因此，LMCache 在本报告中的定位是“真实系统功能验证和风险诊断”。它说明后续如果要把 replay 策略变成真实系统收益，必须在 native Linux 或更稳定的 CUDA IPC 环境中继续验证，并进一步解决 CPU/GPU KV 传输、异步 prefetch 和调度时机问题。
+
+\section{结论与后续工作}
+
+本次实验得到的第一个结论是，vLLM 原生 Prefix Cache 在真实服务模式下确实有效，但收益依赖于长前缀和真实复用。短前缀或 cold 请求不应被用来证明 Prefix Cache 有收益；真正稳定的收益出现在长 prefix 的 warm 请求上。CoQA 1536-token 前缀中，warm median saved 达到 38.37ms，说明在文档问答场景中复用 KV 是有实际意义的。
+
+第二个结论是，GPU-only Prefix Cache 存在明显容量 cliff。g16 到 g24 的变化使 revisit useful-hit rate 从 1.0 降到 0，这比平均延迟变化更能说明问题本质：GPU cache 容量不足时，系统并不是逐渐变差，而是会在工作集超过阈值后把大量有价值前缀驱逐掉。这个 cliff 是引入 offload 的直接动机。
+
+第三个结论是，offload 策略需要 utility-aware，而不能只看命中率。Mixed-length trace 上 size-aware 的 useful-hit rate 高于 CARGO，但 recovered saved 远低于 CARGO，说明保留更多“小而容易命中”的 prefix 并不一定带来更大延迟收益。CARGO 通过公式 \ref{eq:cargo-score} 同时考虑 saved、bytes、历史热度和 reload 成本，因此更符合“有限 GPU/CPU 空间应服务于最大 TTFT 净收益”的目标。
+
+本阶段仍有明显限制。Replay 以 prefix group 为粒度，尚未修改 vLLM 内部 block manager 或实现真实 KV tensor reload；CPU reload 成本也只是用固定带宽模型估计。LMCache 虽然功能跑通，但受 WSL2 CUDA IPC 限制，真实性能结果不能作为最终 offload 加速结论。后续工作应当优先在 native Linux 环境中复现 LMCache GPU transfer，并把 CARGO 的 online score 接入真实 cache admission/eviction 路径；在此基础上，再考虑 queue-aware prefetch、时间衰减热度和跨会话 workload。
+
+\section{AI 工具使用说明}
+
+本项目中我使用 AI 工具辅助完成代码组织、实验脚本整理、图表生成逻辑检查和报告初稿润色。实验设计、关键参数选择、vLLM/LMCache 环境调试、CoQA workload 构造、正式实验运行以及结果判断均由我在本地环境中完成和确认。对于 AI 生成或辅助修改的代码，我通过静态检查、smoke run、正式实验日志和图表结果进行验证；对于报告中的实验结论，我只采用本项目实际产生的 CSV、JSONL 和图表，不使用未跑出的假设数据。
+
+\begin{thebibliography}{9}
+\bibitem{vllm}
+Kwon, W. et al. Efficient Memory Management for Large Language Model Serving with PagedAttention. SOSP 2023.
+\bibitem{coqa}
+Reddy, S., Chen, D., Manning, C. D. CoQA: A Conversational Question Answering Challenge. TACL 2019.
+\bibitem{lmcache}
+LMCache Project. LMCache documentation and vLLM connector quickstart.
+\bibitem{qwen}
+Qwen Team. Qwen2.5 Technical Report and model documentation.
+\end{thebibliography}
+
+\end{document}

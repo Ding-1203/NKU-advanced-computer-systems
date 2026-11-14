@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environment
+.venv/
+.venv-lmcache/
+
+# Model files and caches
+models/
+lmcache_disk/
+
+# Experiment outputs
+logs/
+figures/
+
+# Local secrets and machine-specific files
+.env
+*.env
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# Downloaded datasets
+data/raw/
+data/workloads/coqa/
+data/workloads/coqa_final/

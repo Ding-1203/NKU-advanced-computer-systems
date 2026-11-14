@@ -1,0 +1,26 @@
+# Stage 3 LMCache guard constraints for the verified WSL/vLLM environment.
+# Do not relax these pins unless the whole environment is intentionally rebuilt.
+torch==2.11.0+cu129
+torchaudio==2.11.0+cu129
+torchvision==0.26.0+cu129
+triton==3.6.0
+vllm==0.20.0+cu129
+transformers==5.13.0
+datasets==5.0.0
+flashinfer-python==0.6.8.post1
+flashinfer-cubin==0.6.8.post1
+torch-c-dlpack-ext==0.1.5
+
+# Additional resolver guards discovered by the first LMCache dry-run.
+# Keep these pinned so LMCache cannot silently downgrade the validated vLLM stack.
+numpy==2.3.5
+protobuf==7.35.1
+prometheus-client==0.25.0
+opentelemetry-api==1.43.0
+opentelemetry-exporter-otlp==1.43.0
+opentelemetry-exporter-otlp-proto-common==1.43.0
+opentelemetry-exporter-otlp-proto-grpc==1.43.0
+opentelemetry-exporter-otlp-proto-http==1.43.0
+opentelemetry-proto==1.43.0
+opentelemetry-sdk==1.43.0
+opentelemetry-semantic-conventions==0.64b0
